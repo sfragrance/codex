@@ -43,6 +43,11 @@ pub(crate) const EOF_MARKER: &str = "*** End of File";
 pub(crate) const CHANGE_CONTEXT_MARKER: &str = "@@ ";
 pub(crate) const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
 
+/// Help text appended to invalid-hunk-header errors. Enumerates the valid markers
+/// and points at the most common cause: a content line that should be added but
+/// is missing its leading `+`.
+pub(crate) const INVALID_HUNK_HEADER_HELP: &str = "Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'. The most common cause is a content line missing its leading '+': every added line must begin with '+'.";
+
 /// Currently, the only OpenAI model that knowingly requires lenient parsing is
 /// gpt-4.1. While we could try to require everyone to pass in a strictness
 /// param when invoking apply_patch, it is a pain to thread it through all of
