@@ -24,6 +24,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: windows-x86_64
+
       - name: Set version
         shell: bash
         run: |
@@ -35,7 +40,8 @@ jobs:
         shell: bash
         env:
           LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
-        run: cargo build --target x86_64-pc-windows-msvc --release
+        run: |
+          cargo build --target x86_64-pc-windows-msvc --release -p codex-cli -p codex-windows-sandbox
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
