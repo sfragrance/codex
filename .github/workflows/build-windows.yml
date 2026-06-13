@@ -41,4 +41,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: codex-windows-x86_64-v${{ inputs.version }}
-          path: codex-rs/target/x86_64-pc-windows-msvc/release/*.exe
+          path: |
+            codex-rs/target/x86_64-pc-windows-msvc/release/codex.exe
+            codex-rs/target/x86_64-pc-windows-msvc/release/codex-windows-sandbox-setup.exe
