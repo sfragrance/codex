@@ -12,6 +12,7 @@ use crate::session::Codex;
 use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
 use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::resolve_multi_agent_version;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
@@ -20,7 +21,10 @@ use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
+use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::LoadedUserInstructions;
+use codex_extension_api::UserInstructionsProvider;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_login::AuthManager;
@@ -38,6 +42,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
@@ -73,6 +78,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tracing::instrument;
 use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
@@ -180,6 +186,7 @@ pub struct StartThreadOptions {
     pub metrics_service_name: Option<String>,
     pub parent_trace: Option<W3cTraceContext>,
     pub environments: Vec<TurnEnvironmentSelection>,
+    pub thread_extension_init: ExtensionDataInit,
 }
 
 pub(crate) struct ResumeThreadWithHistoryOptions {
@@ -205,6 +212,7 @@ pub(crate) struct ThreadManagerState {
     plugins_manager: Arc<PluginsManager>,
     mcp_manager: Arc<McpManager>,
     extensions: Arc<ExtensionRegistry<Config>>,
+    user_instructions_provider: Arc<dyn UserInstructionsProvider>,
     thread_store: Arc<dyn ThreadStore>,
     attestation_provider: Option<Arc<dyn AttestationProvider>>,
     session_source: SessionSource,
@@ -255,6 +263,7 @@ impl ThreadManager {
         session_source: SessionSource,
         environment_manager: Arc<EnvironmentManager>,
         extensions: Arc<ExtensionRegistry<Config>>,
+        user_instructions_provider: Arc<dyn UserInstructionsProvider>,
         analytics_events_client: Option<AnalyticsEventsClient>,
         thread_store: Arc<dyn ThreadStore>,
         state_db: Option<StateDbHandle>,
@@ -264,11 +273,15 @@ impl ThreadManager {
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
-        let plugins_manager = Arc::new(PluginsManager::new_with_restriction_product(
+        let plugins_manager = Arc::new(PluginsManager::new_with_options(
             codex_home.to_path_buf(),
             restriction_product,
+            auth_manager.get_api_auth_mode(),
         ));
-        let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+        let mcp_manager = Arc::new(McpManager::new_with_extensions(
+            Arc::clone(&plugins_manager),
+            Arc::clone(&extensions),
+        ));
         let skills_manager = Arc::new(SkillsManager::new_with_restriction_product(
             codex_home,
             config.bundled_skills_enabled(),
@@ -284,6 +297,7 @@ impl ThreadManager {
                 plugins_manager,
                 mcp_manager,
                 extensions,
+                user_instructions_provider,
                 thread_store,
                 attestation_provider,
                 auth_manager,
@@ -354,9 +368,10 @@ impl ThreadManager {
         };
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let restriction_product = SessionSource::Exec.restriction_product();
-        let plugins_manager = Arc::new(PluginsManager::new_with_restriction_product(
+        let plugins_manager = Arc::new(PluginsManager::new_with_options(
             codex_home.clone(),
             restriction_product,
+            auth_manager.get_api_auth_mode(),
         ));
         let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
         let skills_manager = Arc::new(SkillsManager::new_with_restriction_product(
@@ -385,6 +400,9 @@ impl ThreadManager {
                 plugins_manager,
                 mcp_manager,
                 extensions: empty_extension_registry(),
+                user_instructions_provider: Arc::new(
+                    crate::test_support::EmptyUserInstructionsProvider,
+                ),
                 thread_store,
                 attestation_provider: None,
                 auth_manager,
@@ -434,8 +452,25 @@ impl ThreadManager {
         &self,
         environments: &[TurnEnvironmentSelection],
     ) -> CodexResult<()> {
-        resolve_environment_selections(self.state.environment_manager.as_ref(), environments)
-            .map(|_| ())
+        let mut environment_ids = HashSet::with_capacity(environments.len());
+        for environment in environments {
+            if !environment_ids.insert(environment.environment_id.as_str()) {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "duplicate turn environment id `{}`",
+                    environment.environment_id
+                )));
+            }
+            self.state
+                .environment_manager
+                .get_environment(&environment.environment_id)
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "unknown turn environment id `{}`",
+                        environment.environment_id
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     pub fn get_models_manager(&self) -> SharedModelsManager {
@@ -508,14 +543,12 @@ impl ThreadManager {
         &self,
         thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
-        let thread = self.state.get_thread(thread_id).await?;
-
         let mut subtree_thread_ids = Vec::new();
         let mut seen_thread_ids = HashSet::new();
         subtree_thread_ids.push(thread_id);
         seen_thread_ids.insert(thread_id);
 
-        if let Some(state_db_ctx) = thread.state_db() {
+        if let Some(state_db_ctx) = self.state.state_db() {
             for status in [
                 DirectionalThreadSpawnEdgeStatus::Open,
                 DirectionalThreadSpawnEdgeStatus::Closed,
@@ -534,11 +567,8 @@ impl ThreadManager {
             }
         }
 
-        for descendant_id in thread
-            .codex
-            .session
-            .services
-            .agent_control
+        for descendant_id in self
+            .agent_control()
             .list_live_agent_subtree_thread_ids(thread_id)
             .await?
         {
@@ -574,6 +604,7 @@ impl ThreadManager {
             metrics_service_name: None,
             parent_trace: None,
             environments,
+            thread_extension_init: ExtensionDataInit::default(),
         }))
         .await
     }
@@ -612,6 +643,7 @@ impl ThreadManager {
             /*inherited_exec_policy*/ None,
             options.parent_trace,
             options.environments,
+            options.thread_extension_init,
             /*user_shell_override*/ None,
         ))
         .await
@@ -639,10 +671,16 @@ impl ThreadManager {
                 ))
             })?;
         let history = stored_thread_to_initial_history(stored_thread, fork_source.rollout_path())?;
+        let inherited_multi_agent_version = fork_source
+            .multi_agent_version()
+            .unwrap_or(MultiAgentVersion::V1);
         options.initial_history = fork_history_from_snapshot(
             ForkSnapshot::Interrupted,
             history,
-            InterruptedTurnHistoryMarker::from_config(&options.config),
+            InterruptedTurnHistoryMarker::from_config_and_version(
+                &options.config,
+                inherited_multi_agent_version,
+            ),
         );
         self.start_thread_with_options_and_fork_source(options, Some(forked_from_thread_id))
             .await
@@ -665,6 +703,7 @@ impl ThreadManager {
         .await
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub async fn resume_thread_with_history(
         &self,
         config: Config,
@@ -694,6 +733,7 @@ impl ThreadManager {
             /*inherited_exec_policy*/ None,
             parent_trace,
             environments,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
             /*user_shell_override*/ None,
         ))
         .await
@@ -720,6 +760,7 @@ impl ThreadManager {
             /*metrics_service_name*/ None,
             /*parent_trace*/ None,
             environments,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
             /*user_shell_override*/ Some(user_shell_override),
         ))
         .await
@@ -755,6 +796,7 @@ impl ThreadManager {
             /*inherited_exec_policy*/ None,
             /*parent_trace*/ None,
             environments,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
             /*user_shell_override*/ Some(user_shell_override),
         ))
         .await
@@ -894,7 +936,18 @@ impl ThreadManager {
             InitialHistory::Forked(_) => history.forked_from_id(),
             InitialHistory::New | InitialHistory::Cleared => None,
         };
-        let interrupted_marker = InterruptedTurnHistoryMarker::from_config(&config);
+        let multi_agent_version = self
+            .state
+            .effective_multi_agent_version_for_spawn(
+                &history,
+                /*session_source*/ None,
+                /*parent_thread_id*/ None,
+                forked_from_thread_id,
+                &config,
+            )
+            .await;
+        let interrupted_marker =
+            InterruptedTurnHistoryMarker::from_config_and_version(&config, multi_agent_version);
         let history = fork_history_from_snapshot(snapshot, history, interrupted_marker);
         let environments = default_thread_environment_selections(
             self.state.environment_manager.as_ref(),
@@ -912,6 +965,7 @@ impl ThreadManager {
             /*metrics_service_name*/ None,
             parent_trace,
             environments,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
             /*user_shell_override*/ None,
         ))
         .await
@@ -1018,6 +1072,102 @@ impl ThreadManagerState {
         self.threads.write().await.remove(thread_id)
     }
 
+    pub(crate) async fn effective_multi_agent_version_for_spawn(
+        &self,
+        initial_history: &InitialHistory,
+        session_source: Option<&SessionSource>,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+        config: &Config,
+    ) -> MultiAgentVersion {
+        self.initial_multi_agent_version_for_spawn(
+            initial_history,
+            session_source,
+            parent_thread_id,
+            forked_from_thread_id,
+        )
+        .await
+        .unwrap_or_else(|| config.multi_agent_version_from_features())
+    }
+
+    async fn initial_multi_agent_version_for_spawn(
+        &self,
+        initial_history: &InitialHistory,
+        session_source: Option<&SessionSource>,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> Option<MultiAgentVersion> {
+        let inherited_thread_id = match session_source {
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            })) => Some(*parent_thread_id),
+            _ => match initial_history {
+                InitialHistory::Resumed(resumed) => Some(resumed.conversation_id),
+                InitialHistory::Forked(_) => forked_from_thread_id.or(parent_thread_id),
+                InitialHistory::New | InitialHistory::Cleared => parent_thread_id,
+            },
+        };
+        let inherited_multi_agent_version = match inherited_thread_id {
+            Some(thread_id) => self
+                .get_thread(thread_id)
+                .await
+                .ok()
+                .and_then(|thread| thread.multi_agent_version()),
+            None => None,
+        };
+        resolve_multi_agent_version(initial_history, inherited_multi_agent_version)
+    }
+
+    /// Resolves the provider snapshot for a newly spawned runtime.
+    ///
+    /// Loads a fresh provider snapshot for:
+    /// - fresh root threads;
+    /// - cold resumes;
+    /// - root forks.
+    ///
+    /// Uses an existing snapshot for:
+    /// - subagents, which inherit from their parent without invoking the
+    ///   provider;
+    /// - running resumes and compaction paths, which retain the live session.
+    ///
+    /// Provider warnings only apply to fresh loads. If a parent runtime is no
+    /// longer available, its child starts without provider instructions rather
+    /// than loading independently.
+    async fn user_instructions_for_spawn(
+        &self,
+        session_source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> LoadedUserInstructions {
+        let is_root_agent = !session_source.is_non_root_agent();
+        if is_root_agent {
+            return self
+                .user_instructions_provider
+                .load_user_instructions()
+                .await;
+        }
+
+        let inherited_thread_id = match session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => Some(*parent_thread_id),
+            _ => parent_thread_id.or(forked_from_thread_id),
+        };
+        let instructions = match inherited_thread_id {
+            // The spawn path retains only thread IDs, so look up the live
+            // runtime again here to inherit its user instructions.
+            Some(thread_id) => match self.get_thread(thread_id).await {
+                Ok(thread) => thread.codex.session.user_instructions().await,
+                Err(_) => None,
+            },
+            None => None,
+        };
+        LoadedUserInstructions {
+            instructions,
+            warnings: Vec::new(),
+        }
+    }
+
     /// Spawn a new thread with no history using a provided config.
     pub(crate) async fn spawn_new_thread(
         &self,
@@ -1071,6 +1221,7 @@ impl ThreadManagerState {
             inherited_exec_policy,
             /*parent_trace*/ None,
             environments,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
             /*user_shell_override*/ None,
         ))
         .await
@@ -1107,6 +1258,7 @@ impl ThreadManagerState {
             inherited_exec_policy,
             /*parent_trace*/ None,
             environments,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
             /*user_shell_override*/ None,
         ))
         .await
@@ -1144,6 +1296,7 @@ impl ThreadManagerState {
             inherited_exec_policy,
             /*parent_trace*/ None,
             environments,
+            /*thread_extension_init*/ ExtensionDataInit::default(),
             /*user_shell_override*/ None,
         ))
         .await
@@ -1164,6 +1317,7 @@ impl ThreadManagerState {
         metrics_service_name: Option<String>,
         parent_trace: Option<W3cTraceContext>,
         environments: Vec<TurnEnvironmentSelection>,
+        thread_extension_init: ExtensionDataInit,
         user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
         Box::pin(self.spawn_thread_with_source(
@@ -1181,6 +1335,7 @@ impl ThreadManagerState {
             /*inherited_exec_policy*/ None,
             parent_trace,
             environments,
+            thread_extension_init,
             user_shell_override,
         ))
         .await
@@ -1203,6 +1358,7 @@ impl ThreadManagerState {
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         parent_trace: Option<W3cTraceContext>,
         environments: Vec<TurnEnvironmentSelection>,
+        thread_extension_init: ExtensionDataInit,
         user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
@@ -1228,15 +1384,28 @@ impl ThreadManagerState {
             }
         }
         let environment_selections =
-            resolve_environment_selections(self.environment_manager.as_ref(), &environments)?;
+            resolve_environment_selections(self.environment_manager.as_ref(), &environments)
+                .await?;
+        let user_instructions = self
+            .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
+            .await;
         let parent_rollout_thread_trace = self
             .parent_rollout_thread_trace_for_source(&session_source, &initial_history)
             .await;
         let tracked_session_source = session_source.clone();
+        let multi_agent_version = self
+            .initial_multi_agent_version_for_spawn(
+                &initial_history,
+                Some(&session_source),
+                parent_thread_id,
+                forked_from_thread_id,
+            )
+            .await;
         let CodexSpawnOk {
             codex, thread_id, ..
-        } = Codex::spawn(CodexSpawnArgs {
+        } = Box::pin(Codex::spawn(CodexSpawnArgs {
             config,
+            user_instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
@@ -1259,19 +1428,18 @@ impl ThreadManagerState {
             user_shell_override,
             parent_trace,
             environment_selections,
+            thread_extension_init,
             analytics_events_client: self.analytics_events_client.clone(),
             thread_store: Arc::clone(&self.thread_store),
             attestation_provider: self.attestation_provider.clone(),
-        })
+            inherited_multi_agent_version: multi_agent_version,
+        }))
         .await?;
         let new_thread = self
             .finalize_thread_spawn(codex, thread_id, tracked_session_source)
             .await?;
         if is_resumed_thread {
             new_thread.thread.emit_thread_resume_lifecycle().await;
-            if let Err(err) = new_thread.thread.apply_goal_resume_runtime_effects().await {
-                warn!("failed to apply goal resume runtime effects: {err}");
-            }
         }
         Ok(new_thread)
     }

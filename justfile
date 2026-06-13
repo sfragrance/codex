@@ -75,13 +75,17 @@ install:
 # there should be no need to add `--all-features`.
 [unix]
 test *args:
-    RUST_MIN_STACK={{ rust_min_stack }} cargo nextest run --no-fail-fast "$@"
-    just bench-smoke
+    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
 
 [windows]
 test *args:
-    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
-    just bench-smoke
+    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
+
+# Run from the repository root so scripts that resolve paths from `cwd` see
+# the same layout they use in GitHub Actions.
+[no-cd]
+test-github-scripts:
+    {{ python }} -m unittest discover -s {{ justfile_directory() }}/.github/scripts -p 'test_*.py'
 
 # Run explicit workspace benchmark targets.
 bench *args:
@@ -129,11 +133,8 @@ bazel-clippy:
 bazel-argument-comment-lint:
     bazel build --config=argument-comment-lint -- $({{ justfile_directory() }}/tools/argument-comment-lint/list-bazel-targets.sh)
 
-bazel-remote-test:
-    bazel test --test_tag_filters=-argument-comment-lint //... --config=remote --platforms=//:rbe --keep_going
-
 build-for-release:
-    bazel build //codex-rs/cli:release_binaries --config=remote
+    bazel build //codex-rs/cli:release_binaries
 
 # Run the MCP server
 mcp-server-run *args:
